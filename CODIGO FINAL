@@ -1,0 +1,397 @@
+from machine import Pin, ADC, PWM, I2C # Importo clases para controlar pines digitales, entradas analógicas, PWM y bus I2C
+import dht, network, socket, time, ntptime, ujson, gc # Importo librerías para DHT, WiFi, sockets, tiempo, NTP, JSON y recolección de basura
+import utelegram # Importo la librería para usar un bot de Telegram
+import ssd1306  # Importo controlador del display OLED SSD1306
+
+# Nombre y contraseña del WiFi al que se conectará el ESP32
+SSID = "Yesenia"          # Nombre de la red WiFi (SSID)
+PASSWORD = "12345678"     # Contraseña de la red WiFi
+
+# Configuración del bot de Telegram (para alertas)
+TELEGRAM_TOKEN = "8411946075:AAEEtKVy9YVdNxgRaIXzwrtGFvq0PHq5eQU" # Token del bot de Telegram (credencial)
+TELEGRAM_CHAT_ID = "6651860477"                                   # ID del chat/usuario donde se enviarán las alertas
+
+# Identidad del nodo → Requisito del alcance
+NODE_ID = "NODO_01"                                              # Nombre identificador del nodo usado en logs y mensajes     
+
+DHT_PIN = 18      # DHT11 temperatura-humedad                  # Pin donde está conectado el sensor DHT11
+PIR_PIN = 12      # Sensor de movimiento PIR                   # Pin del sensor PIR (movimiento)
+SOUND_PIN = 13    # Sensor de sonido                           # Pin del sensor de sonido (digital)
+LDR_PIN = 34      # LDR (analógico)                            # Pin ADC donde está la LDR
+
+VENT_PIN = 26     # Ventilador / actuador lógico               # Pin para activar el ventilador (salida digital)
+BUZZER_PIN = 25   # Buzzer piezoeléctrico                      # Pin para el buzzer usando PWM
+LEDV_PIN = 4      # LED Verde (alerta de lux)                  # Pin LED verde indicación luz
+LEDR_PIN = 14     # LED Rojo (alertas varias)                  # Pin LED rojo para alertas
+LEDA_PIN = 2      # LED Azul (alerta humedad)                  # Pin LED azul para alerta de humedad
+
+SERVO_PIN = 27    # Servo motor (activado por umbral de luz)   # Pin PWM para el servo
+
+
+# Sensores
+dht_sensor = dht.DHT11(Pin(DHT_PIN))                # Creo instancia del DHT11 usando el pin definido
+pir = Pin(PIR_PIN, Pin.IN)                          # Configuro el pin del PIR como entrada digital
+sound = Pin(SOUND_PIN, Pin.IN)                      # Configuro el pin del sensor de sonido como entrada
+ldr = ADC(Pin(LDR_PIN)); ldr.atten(ADC.ATTN_11DB)   # Inicializo ADC para la LDR y pongo atenuación para rango 0–4095 ( Permite leer el voltaje completo del divisor con la LDR)
+
+# Actuadores
+ventilador = Pin(VENT_PIN, Pin.OUT)                 # Pin del ventilador como salida digital
+buzzer = PWM(Pin(BUZZER_PIN))                       # Configuro buzzer como salida PWM para controlar frecuencia/duty
+LedV = Pin(LEDV_PIN, Pin.OUT)                       # LED verde como salida
+LedR = Pin(LEDR_PIN, Pin.OUT)                       # LED rojo como salida
+LedA = Pin(LEDA_PIN, Pin.OUT)                       # LED azul como salida 
+
+# Servo motor PWM a 50 Hz (estándar)
+servo_pwm = PWM(Pin(SERVO_PIN), freq=50)            # Configuro PWM para el servo con frecuencia 50Hz
+
+
+# Display OLED I2C para visualización local
+i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=100000)  # Inicializo bus I2C en los pines 22 (SCL) y 21 (SDA)
+oled = ssd1306.SSD1306_I2C(128, 64, i2c)             # Inicializo pantalla SSD1306 de 128x64 sobre I2C
+
+
+# Valores por defecto si aún no se ajustan desde el dashboard
+# Estos umbrales pueden ser modificados vía HTTP desde la red
+umbral_temp = 30                                     # Umbral de temperatura (°C) para alertas
+umbral_hum = 70                                      # Umbral de humedad (%) para alertas
+umbral_lux = 30                                      # Umbral de lux/valor LDR para alertas
+
+# Estados internos para evitar repetición de alertas
+alarma_temp_sonando = False                         # Flag para evitar re-alertar temperatura continuamente
+alarma_hum_sonando = False                          # Flag para evitar re-alertar humedad continuamente
+alarma_lux_sonando = False                          # Flag para evitar re-alertar luz continuamente
+
+# Buffers para gráficos del dashboard
+MAX_SAMPLES = 60                                    # Máximo de muestras a almacenar para graficar
+temps, hums, luxs, times = [], [], [], []           # Listas vacías para temperaturas, humedades, lux y timestamps
+
+# Registro de eventos (para auditoría interna del nodo)
+event_log = []                                      # Lista para almacenar eventos con timestamp
+
+# Bot de Telegram
+bot = utelegram.ubot(TELEGRAM_TOKEN)                 # Creo instancia del bot de Telegram con el token dado
+
+
+# Buffer de hasta 60 muestras para graficar en dashboard HTML
+def push_buffer(buf, val):                           # Función auxiliar para agregar valores a un buffer circular
+    buf.append(val)                                  # Agrego el valor al final
+    if len(buf) > MAX_SAMPLES:                       # Si se excede el tamaño permitido
+        buf.pop(0)                                   # Elimino el elemento más antiguo 
+
+# Mostrar variables en OLED (cumple alcance de visualización local)
+def mostrar_oled(temp, hum, lux, mov, sonido):        # Función que actualiza la pantalla OLED con los valores actuales
+    try:
+        oled.fill(0)                                  # Limpio la pantalla (fondo negro)
+        oled.text("Nodo:{}".format(NODE_ID), 0, 0)    # Escribo el nombre del nodo en la primera línea
+        oled.text("T:{}C".format(temp if temp is not None else "--"), 0, 14)  # Muestro temperatura o -- si no hay lectura, Si temp existe, muestra su valor; si no, muestra "--"posicion "x" 0 y posicion "Y" 14 
+        oled.text("H:{}%".format(hum if hum is not None else "--"), 0, 26)    # Muestra "H:valor%" si humumedad tiene dato; si humumedad es None muestra "H:--%" en la posición (0,26)
+        oled.text("L:{}".format(lux if lux is not None else "--"), 0, 38)     # Muestra "L:valor" si lux tiene dato; si lux es None muestra "L:--" en la posición (0,38)
+        oled.text("M:{} S:{}".format("1" if mov else "0", "1" if sonido else "0"), 0, 50)  # Muestro indicadores de movimiento y sonido
+        oled.show()                                                           # Refresco la pantalla para mostrar lo escrito
+    except:
+        pass                                                                  # Si ocurre un error (p. ej. pantalla desconectada), lo ignoro
+
+# Registro de eventos + envío a Telegram
+def get_timestamp():                                                         # Función para obtener timestamp formateado legible                                       
+    t = time.localtime()                                                     # Obtengo la hora local del sistema                   
+    return "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(               # Construye una cadena con el formato AAAA-MM-DD HH:MM:SS
+        t[0], t[1], t[2], t[3], t[4], t[5]                                   # Inserta año, mes, día, hora, minuto y segundo desde la tupla t
+    )
+
+def log_event(msg):                                                          # Función para registrar un evento y tratar de notificar por Telegram
+    ts = get_timestamp()                                                     # Obtengo timestamp actual                                         
+    ev = {"time": ts, "node": NODE_ID, "event": msg}                         # Construyo diccionario con información del evento            
+    event_log.append(ev)                                                     # Agrego evento al registro                         
+
+    if len(event_log) > 200:                                                 # Si la lista de eventos supera 200 elementos, significa que ya está demasiado larga
+        event_log.pop(0)                                                     # Elimino el evento más antiguo para limitar tamaño 
+
+    print("EVENT:", ev)                                                      # Imprimo el evento por consola (serial)             
+
+    try:
+        bot.send(TELEGRAM_CHAT_ID, "{} | {}".format(ts, msg))                # Envía al chat de Telegram un mensaje formado por timestamp ts y el texto msg
+    except:
+        pass                                                                 # Si falla el envío, no hace nada 
+
+# Buzzer sencillo para alertas
+def beep_once(freq, ms):                                                     # Función que emite un pitido con frecuencia y duración dadas
+    try:
+        buzzer.freq(freq)                                                    # Configuro la frecuencia del PWM del buzzer                                         
+        buzzer.duty(512)                                                     # Establezco duty para sonar (valor medio) 
+    except:
+        pass                                                                 # Si falló PWM, continua sin excepción que detenga todo
+    time.sleep_ms(ms)                                                        # Espera los milisegundos deseados
+    try:
+        buzzer.duty(0)                                                       # Apago el buzzer poniendo duty en 0
+    except:
+        pass
+
+# Control del servo según ángulo (para umbral de luz)
+def set_servo(angle):                                                        # Función que posiciona el servo a un ángulo 0–180                                          
+    duty = int((angle / 180) * 90 + 40)                                      # Convierte el ángulo (0–180°) a un valor de PWM entre 40 y 130 para mover el servo                   
+    try:
+        servo_pwm.duty(duty)                                                 # Aplico duty al PWM del servo
+    except:
+        pass                                                                 # Ignoro errores de hardware en servo                                                                
+
+# Sincronización horaria NTP → requisito del alcance ("reloj de nodo") LINEA 161
+def sync_time():                                                             # Función para sincronizar la hora con servidores NTP
+    try:
+        ntptime.settime()                                                    # Intento sincronizar la hora del sistema
+        log_event("NTP sync OK")                                             # Registo evento de éxito                                       
+    except:
+        log_event("NTP failed")                                              # Registro evento de fallo si ocurre excepción
+
+
+# Conexión a la red usando método WLAN de MicroPython
+def wifi_connect():                                                          # Función para conectar el ESP32 a la red WiFi configurada
+    wlan = network.WLAN(network.STA_IF)                                      # Crea la interfaz WiFi en modo estación (STA) para que la ESP32 se conecte a un router
+    wlan.active(True)                                                        # Habilita la interfaz
+
+    if not wlan.isconnected():                                               # Si aún no está conectado                                    
+        wlan.connect(SSID, PASSWORD)                                         # Inicio la conexión con SSID y PASSWORD
+        for _ in range(20):                                                  # Repite el bloque de código 20 veces;se usa cuando no importa el nombre de la variable del ciclo
+            if wlan.isconnected():                                           # Verifica si la ESP32 ya está conectada a la red WiFi
+                break
+            time.sleep(1)                                                    # Espera 1 segundo antes de continuar, útil para no saturar el intento de conexión
+
+    if wlan.isconnected():                                                   # Verifica si la ESP32 logró conectarse exitosamente a la red WiFi
+        return wlan.ifconfig()[0]                                            # Devuelve la dirección IP asignada a la ESP32 tras conectarse al WiFi
+
+    raise RuntimeError("WiFi failed")                                        # Lanza un error indicando que la conexión WiFi falló y detiene la ejecución
+
+# Inicia socket y queda escuchando en puerto 80
+def start_server():                                                           # Define la función que inicia el servidor web
+    addr = socket.getaddrinfo("0.0.0.0", 80)[0][-1]                           # Obtiene la dirección IP y el puerto (0.0.0.0:80) para aceptar conexiones desde cualquier cliente
+    s = socket.socket()                                                       # Crea un nuevo socket, que será el servidor
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)                   # Permite reutilizar la dirección inmediatamente sin esperar tiempo de liberación
+    s.bind(addr)                                                              # Asocia el socket al puerto 80 en la IP obtenida
+    s.listen(5)                                                               # Comienza a escuchar conexiones entrantes, permitiendo hasta 5 en cola
+    s.settimeout(0.5)                                                         # Define un tiempo máximo de espera de 0.5 segundos para evitar bloquear el programa
+    return                                                                    # Devuelve el socket del servidor para usarlo fuera de la función
+
+# Cargar página HTML del dashboard
+def load_index():                                                             # Función que intenta leer index.html desde el sistema de archivos
+    try:
+        with open("index.html", "r") as f:                                    # Abro el archivo en modo lectura                             
+            return f.read()                                                   # Devuelvo el contenido HTML                                             
+    except:
+        return "<h1>Index missing</h1>"                                       # Si no existe el archivo, devuelvo mensaje HTML sencillo                       
+
+
+# Permite controlar los umbrales desde el navegador
+def control_api(path):                                                       # API muy simple para ajustar umbrales mediante query string
+    global umbral_temp, umbral_hum, umbral_lux                               # Indico que voy a modificar variables globales                          
+
+    if "settemp=" in path:                                                   # Si la URL contiene el parámetro 'settemp='
+        umbral_temp = int(path.split("settemp=")[1].split("&")[0])           # Extrae el valor que viene después de 'settemp=' hasta el siguiente '&' y lo convierte a entero
+        log_event("Umbral temp -> {}".format(umbral_temp))                   # Registra en el log que el umbral de temperatura ha cambiado
+
+    if "sethum=" in path:                                                    # Si la URL contiene el parámetro 'sethum='
+        umbral_hum = int(path.split("sethum=")[1].split("&")[0])             # Extrae el valor asignado a 'sethum=' y lo convierte a entero
+        log_event("Umbral hum -> {}".format(umbral_hum))                     # Guarda en el log que el umbral de humedad se modificó
+
+    if "setlux=" in path:                                                    # Si la URL contiene el parámetro 'setlux='
+        umbral_lux = int(path.split("setlux=")[1].split("&")[0])             # Extrae el valor de 'setlux=' desde la URL y lo convierte a entero
+        log_event("Umbral lux -> {}".format(umbral_lux))                     # Registra el cambio de umbral de luz en el log
+
+    return {"ok": True}                                                      # Devuelve un diccionario indicando que la operación fue exitosa
+
+
+
+#INICIO DEL SISTEMA 
+
+print("Iniciando...")                                          # Imprime en la consola/serial el mensaje "Iniciando..." para indicar que el programa está arrancando
+ip = wifi_connect()        # conexión WiFi → requisito alcance   # Llama a la función wifi_connect() que intenta conectar el ESP32 al WiFi; guarda la IP devuelta en la variable ip
+sync_time()                # sincronización NTP → requisito alcance  # Llama a sync_time() para sincronizar el reloj del dispositivo con un servidor NTP (requisitos de tiempo del nodo)
+server = start_server()    # servidor HTTP local                  # Inicia el servidor web llamando a start_server(); guarda el socket/objeto servidor en server
+html = load_index()        # dashboard                            # Carga el contenido HTML del dashboard desde el archivo index.html (o un mensaje por defecto) y lo guarda en html
+
+log_event("Nodo iniciado en {}".format(ip))                   # Registra un evento en el log interno con la IP donde arrancó el nodo y trata de enviar la notificación por Telegram
+
+# Notificación por Telegram de inicio
+try:
+    bot.send(TELEGRAM_CHAT_ID, "Nodo {} iniciado. Dashboard: http://{}".format(NODE_ID, ip))  # Intenta enviar por el bot de Telegram un mensaje notificando el inicio y la URL del dashboard
+except:
+    pass                                                      # Si el envío falla (p. ej. sin conexión), se ignora la excepción para no detener el programa
+
+last = time.ticks_ms()                                        # Guarda el timestamp actual en milisegundos (marca del último muestreo) en la variable last
+servo_active_angle = 90                                       # Define el ángulo "activo" del servo (cuando hay alta luz); valor en grados (0–180)
+servo_idle_angle = 0                                          # Define el ángulo "idle" o de reposo del servo (cuando no hay alerta de luz)
+set_servo(servo_idle_angle)                                   # Mueve el servo a la posición de reposo al arrancar, asegurando estado conocido
+
+while True:                                                    # Comienza el bucle principal que se ejecuta indefinidamente mientras el dispositivo esté encendido
+    gc.collect()                                               # Llama al recolector de basura para liberar memoria RAM antes de realizar operaciones pesadas
+
+
+    
+    #  LECTURA DE SENSORES CADA 1.5 s 
+    
+    if time.ticks_diff(time.ticks_ms(), last) > 1500:             # Si han pasado más de 1500 ms desde la última lectura (controla el muestreo cada ~1.5 s)
+
+    # Lectura temperatura / humedad
+    try:
+        dht_sensor.measure()                                 # Ordeno al DHT11 que realice una medición (inicia la conversión interna)
+        temp = dht_sensor.temperature()                      # Leo la temperatura en °C medida por el DHT11 y la guardo en 'temp'
+        hum = dht_sensor.humidity()                          # Leo la humedad relativa (%) medida por el DHT11 y la guardo en 'hum'
+    except:
+        temp = None; hum = None                              # Si ocurre cualquier error con el DHT (timing, sensor desconectado), asigno None para indicar fallo
+
+    # Lectura lux (LDR)
+    try:
+        lux_raw = ldr.read()                                 # Leo el valor crudo del ADC (0–4095) proveniente del divisor con la LDR
+        lux = int((lux_raw * 50) / 4095)                     # Escalo el valor crudo a una aproximación 0–50 (facilidad de uso) y lo convierto a entero
+    except:
+        lux = None                                           # Si falla la lectura ADC, dejo lux en None para manejar la ausencia de dato
+
+    # Sensores digitales
+    mov = pir.value()                                       # Leo el valor digital del PIR: 1 si detecta movimiento, 0 si no
+    son = sound.value()                                     # Leo el valor digital del sensor de sonido: 1 si detecta ruido, 0 si está en reposo
+
+        # Guardar en buffers del dashboard
+        
+        push_buffer(temps, temp if temp is not None else 0)     # Agrego la temperatura al buffer; si temp es None (error de lectura), guardo 0 para no romper la gráfica
+        push_buffer(hums, hum if hum is not None else 0)        # Agrego la humedad al buffer; si hum es None, guardo 0
+        push_buffer(luxs, lux if lux is not None else 0)        # Agrego el nivel de luz; si lux es None, guardo 0
+        push_buffer(times, time.time())                         # Guardo el timestamp actual en segundos para graficar la evolución de las variables
+
+        # Mostrar en OLED (cumple alcance)
+        mostrar_oled(temp, hum, lux, mov, son)                  # Actualizo la pantalla OLED mostrando temperatura, humedad, luz, movimiento y sonido
+
+      # LÓGICA DE ACTUADORES
+
+
+      # LUZ / SERVO
+      if lux is not None and lux > umbral_lux:                # Si la lectura de luz existe y está por encima del umbral configurado
+          set_servo(servo_active_angle)                       # Muevo el servo al ángulo activo (por ejemplo, abrir una tapa o mover un mecanismo)
+      if not alarma_lux_sonando:                          # Si la alarma de luz NO estaba activa (evita repetir alertas)
+         alarma_lux_sonando = True                       # Marco que la alarma de luz ahora está activa (flag ON)
+         log_event("Alarma LUZ: {} > {}".format(lux, umbral_lux))  # Registro en log y envío a Telegram que se superó el umbral
+         LedV.on()                                        # Enciendo el LED verde indicando exceso de luz
+         beep_once(1500,150)                              # Hago sonar el buzzer brevemente en 1500 Hz como alerta
+     else:
+         set_servo(servo_idle_angle)                         # Si la luz está dentro de lo normal, dejo el servo en posición reposo
+         if alarma_lux_sonando:                              # Solo ingreso si antes la alarma estaba activa (para no repetir mensajes)
+             alarma_lux_sonando = False                      # Marco la alarma como desactivada
+             LedV.off()                                       # Apago el LED verde (luz normal)
+             log_event("Luz normalizada")                    # Registro el evento indicando que el nivel de luz volvió a la normalidad
+
+
+        # TEMP / HUM → VENTILADOR
+        # TEMP / HUM → VENTILADOR
+vent_should_on = False                                      # Inicializo la variable que decidirá si el ventilador debe encenderse; parte en False (apagar)
+
+      # Temperatura
+      if temp is not None and temp > umbral_temp:                 # Compruebo que exista una lectura válida de temperatura y que supere el umbral configurado
+         vent_should_on = True                                   # Si la temperatura está por encima del umbral, marco que el ventilador debe encenderse
+         if not alarma_temp_sonando:                              # Si la alarma de temperatura no estaba ya activa (evito repetir la alerta)
+            alarma_temp_sonando = True                           # Marco la alarma como activa para no volver a notificar en cada ciclo
+            log_event("Alerta TEMP: {}C".format(temp))           # Registro el evento en el log interno y trato de enviarlo por Telegram (función log_event)
+            LedR.on()                                           # Enciendo el LED rojo para indicar visualmente la alerta de temperatura
+            beep_once(1800,200)                                 # Emito un beep audible (1800 Hz durante 200 ms) para llamar la atención
+      else:                                                        # Si no se cumple la condición (no hay lectura o la temperatura está por debajo del umbral)
+          if alarma_temp_sonando:                                  # Compruebo si antes estaba activa la alarma de temperatura (es decir, hubo una alerta previa)
+             alarma_temp_sonando = False                          # Reseteo el flag: la alarma ya no está activa porque la condición dejó de cumplirse
+             LedR.off()                                          # Apago el LED rojo para indicar que la condición anómala terminó
+             log_event("Temp normalizada")                       # Registro el evento de normalización en el log y (si puede) lo envío por Telegram
+
+       # Humedad
+       if hum is not None and hum > umbral_hum:                     # Compruebo que la lectura de humedad exista y exceda el umbral configurado
+          vent_should_on = True                                   # Si la humedad es alta, también pido que el ventilador se encienda (regla combinada)
+          if not alarma_hum_sonando:                               # Si la alarma de humedad no estaba activa previamente
+             alarma_hum_sonando = True                            # Activo el flag para evitar enviar múltiples notificaciones iguales
+             log_event("Alerta HUM: {}%".format(hum))             # Registro el evento de humedad alta en el log y lo intento enviar por Telegram
+             LedA.on()                                           # Enciendo el LED azul/indicador asociado a la alerta de humedad
+             beep_once(1200,200)                                 # Emito un beep distinto (1200 Hz, 200 ms) para diferenciar la alarma
+      else:                                                       # Si no hay lectura o la humedad está dentro de lo esperado
+          if alarma_hum_sonando:                                  # Si la alarma de humedad estaba activa anteriormente
+              alarma_hum_sonando = False                           # Desactivo el flag porque la condición de alerta terminó
+              LedA.off()                                          # Apago el LED azul para indicar retorno a la normalidad
+              log_event("Hum normalizada")                        # Registro en el log que la humedad volvió a valores normales
+
+        
+        
+
+
+        
+        # Activación del ventilador según reglas múltiples
+ventilador.value(1 if vent_should_on else 0)     # Enciendo el ventilador (1) si vent_should_on es True por temperatura o humedad;
+                                                 # si es False, lo apago (0). Es una forma compacta de escribir un if.
+
+# MOVIMIENTO / SONIDO 
+     if mov:                                           # Si el sensor PIR detectó movimiento (valor 1)
+         log_event("Movimiento detectado")             # Registro el evento y lo envío (si es posible) por Telegram
+         LedR.on()                                     # Enciendo el LED rojo como señal visual de alerta
+         beep_once(1400,150)                           # Suena el buzzer a 1400 Hz durante 150 ms para avisar
+         time.sleep_ms(150)                            # Pausa muy corta para evitar parpadeos muy rápidos del LED
+         LedR.off()                                    # Apago el LED rojo después de la alerta
+
+     if son:                                           # Si el sensor de sonido detectó un ruido fuerte (valor 1)
+         log_event("Sonido detectado")                 # Registro el evento en el log interno y Telegram
+         LedR.on()                                     # Enciendo el LED rojo para alertar visualmente
+         beep_once(1600,150)                           # Suena el buzzer a 1600 Hz durante 150 ms (tono distinto al de movimiento)
+         time.sleep_ms(150)                            # Pausa breve antes de apagar el LED
+         LedR.off()                                    # Apago el LED al terminar la advertencia
+
+     last = time.ticks_ms()                            # Actualizo la variable 'last' con el tiempo actual para medir cada 1.5 s
+
+
+    
+    #SERVIDOR HTTP (NO BLOQUEANTE)
+    
+   try:
+    conn, addr = server.accept()                                      # Acepta una conexión entrante del socket servidor; devuelve un objeto de conexión 'conn' y la dirección remota 'addr'
+    req = conn.recv(1024)                                             # Lee hasta 1024 bytes de la petición HTTP enviada por el cliente (puede ser menor)
+
+    if not req:                                                       # Si no se recibió nada (petición vacía o cliente cerró conexión)
+        conn.close()                                                  # Cierra el socket de la conexión para liberar recursos
+        continue                                                      # Continúa el bucle principal sin procesar más esta iteración
+
+    reqs = req.decode()                                               # Decodifica los bytes recibidos a texto (string) usando la codificación por defecto (utf-8)
+    try:
+        path = reqs.split("\r\n")[0].split(" ")[1]                     # Toma la primera línea de la petición ("GET /ruta HTTP/1.1") y extrae la ruta solicitada (posición 1)
+    except:
+        path = "/"                                                     # Si falla el parseo, asume la raíz "/" como ruta por defecto
+
+    # Dashboard
+    if path == "/" or path.startswith("/index.html"):                  # Si el cliente solicita la raíz o el index.html
+        conn.send("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n")  # Envía cabeceras HTTP indicando éxito y tipo de contenido HTML
+        conn.sendall(html)                                             # Envía todo el contenido HTML previamente cargado en la variable 'html'
+
+    # API de datos para las gráficas
+    elif path.startswith("/data"):                                      # Si la ruta comienza con /data, se responde con información en JSON
+        payload = {                                                     # Construye un diccionario Python con la información que queremos exponer al dashboard
+            "node": NODE_ID,                                            # Identificador del nodo (para saber qué dispositivo responde)
+            "time": time.time(),                                        # Marca de tiempo actual en segundos (epoch)
+            "temp": temps[-1] if temps else None,                       # Última temperatura registrada si existe alguna muestra, si no -> None
+            "hum": hums[-1] if hums else None,                          # Última humedad registrada o None si no hay datos
+            "lux": luxs[-1] if luxs else None,                          # Último valor de lux registrado o None si no hay datos
+            "temps": temps,                                             # Lista completa de temperaturas almacenadas en el buffer (hasta MAX_SAMPLES)
+            "hums": hums,                                               # Lista completa de humedades almacenadas
+            "luxs": luxs,                                               # Lista completa de valores de luz almacenados
+            "times": times,                                             # Lista de timestamps correspondientes a cada muestra
+            "event_log": event_log[-30:],                               # Últimos 30 eventos del registro para mostrar historial reciente
+            "umbral_temp": umbral_temp,                                 # Umbral actual de temperatura configurado en el nodo
+            "umbral_hum": umbral_hum,                                   # Umbral actual de humedad
+            "umbral_lux": umbral_lux                                    # Umbral actual de luz
+        }
+        js = ujson.dumps(payload)                                       # Convierte el diccionario 'payload' a una cadena JSON lista para enviar por la red
+        conn.send("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")  # Envía cabeceras HTTP indicando éxito y que el contenido es JSON
+        conn.sendall(js)                                                # Envía el JSON completo al cliente (dashboard), cerrando así la respuesta
+
+
+        # API para modificar umbrales
+        elif path.startswith("/control"):
+            control_api(path)
+            conn.send("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")
+            conn.send('{"ok":true}')                     # Respondo con JSON simple de confirmación
+
+        else:
+            conn.send("HTTP/1.1 404 Not Found\r\n\r\n")  # Envía al navegador la respuesta HTTP indicando que la ruta solicitada no existe (error 404)
+
+        conn.close()                                     # Cierra la conexión cuando terminé
+
+    except OSError:
+        pass                                             # Si no hay conexiones (timeout) o hay error de socket, continúo la ejecución
+
+    time.sleep_ms(50)                                    # Pequeña pausa para evitar bucle ocupado y darle tiempo al sistema
